@@ -2,14 +2,15 @@
 /**
  * Product Video - ThirtyBeeS CMS module.
  *
- * Lets you attach a video (YouTube / Vimeo / Dailymotion / direct MP4/WebM/OGV)
- * to every product and displays it inside the product page image block,
- * as an extra "slide" next to the product images in the gallery.
+ * Lets you attach a video (YouTube / Vimeo / Dailymotion / uploaded file /
+ * direct MP4/WebM/OGV URL) to every product and displays it inside the
+ * product page image block, as an extra "slide" next to the product images.
  *
  * Features:
- *  - BO: video field on the product page (extra tab on AdminProducts)
+ *  - BO: video field + file upload on the product page (AdminProducts)
  *  - FO: video rendered in the product image block via displayProductImages hook
- *  - Responsive oEmbed (iframe) for YouTube/Vimeo/Dailymotion, HTML5 <video> for direct files
+ *  - Responsive oEmbed (iframe) for YouTube/Vimeo/Dailymotion, HTML5 <video> for files
+ *  - Direct uploads stored under /img/pv/<id_product>.<ext>, served via Media::getMediaPath
  *
  * @author Your Name <you@example.com>
  * @license MIT
@@ -26,12 +27,17 @@ class Product_Video extends Module
     const TYPE_VIMEO = 'vimeo';
     const TYPE_DAILYMOTION = 'dailymotion';
     const TYPE_DIRECT = 'direct'; // .mp4/.webm/.ogv file
+    const TYPE_LOCAL = 'local';   // file uploaded through this module
+
+    /** Upload settings */
+    const MAX_SIZE_MB = 100;
+    const ALLOWED_EXTENSIONS = array('mp4', 'webm', 'ogv');
 
     public function __construct()
     {
         $this->name = 'product_video';
         $this->tab = 'front_office_features';
-        $this->version = '1.0.0';
+        $this->version = '1.1.0';
         $this->author = 'Your Name';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array('min' => '1.0', 'max' => _PS_VERSION_);
@@ -177,6 +183,9 @@ class Product_Video extends Module
         $this->context->smarty->assign(array(
             'pv_id_product' => $id_product,
             'pv_video_url' => $video['video_url'],
+            'pv_is_local' => $this->getVideoType($video['video_url']) === self::TYPE_LOCAL,
+            'pv_max_size_mb' => self::MAX_SIZE_MB,
+            'pv_token' => Tools::getAdminTokenLite('AdminProducts'),
         ));
 
         return $this->fetch('views/templates/admin/video_tab.tpl');
@@ -195,6 +204,16 @@ class Product_Video extends Module
         $id_product = (int) Tools::getValue('id_product');
         $url = trim((string) Tools::getValue('pv_video_url'));
 
+        // Handle a file upload coming from the "Upload a video file" field
+        if (isset($_FILES['pv_video_file']) && !empty($_FILES['pv_video_file']['name'])
+            && $_FILES['pv_video_file']['error'] !== UPLOAD_ERR_NO_FILE) {
+            $uploaded = $this->handleVideoUpload($_FILES['pv_video_file'], $id_product);
+            if ($uploaded === false) {
+                return; // errors already registered
+            }
+            $url = $uploaded;
+        }
+
         if ($id_product > 0 && $url !== '' && !$this->validateVideoUrl($url)) {
             $this->errors[] = sprintf(
                 $this->l('Invalid video URL: %s. Use YouTube, Vimeo, Dailymotion or a direct .mp4/.webm/.ogv link.'),
@@ -204,6 +223,151 @@ class Product_Video extends Module
         }
 
         $this->setProductVideo($id_product, $url);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*                             File uploads                           */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Validates and stores an uploaded video file.
+     * Files are saved under /img/pv/<id_product>.<ext> and referenced by
+     * their relative URL (e.g. img/pv/42.mp4).
+     *
+     * @param array $file      entry of $_FILES
+     * @param int   $id_product
+     *
+     * @return string|false relative url on success, false on error
+     */
+    public function handleVideoUpload($file, $id_product)
+    {
+        if ($id_product <= 0) {
+            $this->errors[] = $this->l('Cannot upload a video before the product is saved.');
+
+            return false;
+        }
+
+        switch ((int) $file['error']) {
+            case UPLOAD_ERR_OK:
+                break;
+            case UPLOAD_ERR_INI_SIZE:
+            case UPLOAD_ERR_FORM_SIZE:
+                $this->errors[] = sprintf(
+                    $this->l('The uploaded file is too large. The server limit (upload_max_filesize/post_max_size) was exceeded — try a smaller file or increase it in php.ini (%d MB max for this module).'),
+                    self::MAX_SIZE_MB
+                );
+
+                return false;
+            default:
+                $this->errors[] = $this->l('An error occurred while uploading the video file.');
+
+                return false;
+        }
+
+        // Size limit enforced by the module
+        if ((int) $file['size'] > self::MAX_SIZE_MB * 1024 * 1024) {
+            $this->errors[] = sprintf($this->l('The video exceeds the maximum size of %d MB.'), self::MAX_SIZE_MB);
+
+            return false;
+        }
+
+        // Extension + real MIME type checks
+        $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+        if (!in_array($ext, self::ALLOWED_EXTENSIONS)) {
+            $this->errors[] = sprintf(
+                $this->l('Unsupported file type "%s". Allowed types: %s.'),
+                htmlspecialchars($ext, ENT_QUOTES, 'UTF-8'),
+                implode(', ', self::ALLOWED_EXTENSIONS)
+            );
+
+            return false;
+        }
+
+        $mime = $this->detectMimeType($file['tmp_name']);
+        if ($mime !== null && strpos($mime, 'video/') !== 0) {
+            $this->errors[] = $this->l('The uploaded file does not appear to be a valid video.');
+
+            return false;
+        }
+
+        $dir = _PS_IMG_DIR_ . 'pv';
+        if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
+            $this->errors[] = $this->l('Cannot create the upload directory (img/pv). Check write permissions.');
+
+            return false;
+        }
+
+        $dest = _PS_IMG_DIR_ . 'pv/' . (int) $id_product . '.' . $ext;
+
+        // Remove a previous upload (possibly with a different extension)
+        $this->deleteLocalVideoFile($id_product);
+
+        if (!$this->storeUploadedFile($file['tmp_name'], $dest)) {
+            $this->errors[] = $this->l('Failed to save the uploaded video file.');
+
+            return false;
+        }
+
+        return 'img/pv/' . (int) $id_product . '.' . $ext;
+    }
+
+    /**
+     * Moves the uploaded temp file to its final location.
+     * (Extracted as a seam so it can be unit-tested outside a web SAPI.)
+     *
+     * @param string $tmpName
+     * @param string $dest
+     *
+     * @return bool
+     */
+    protected function storeUploadedFile($tmpName, $dest)
+    {
+        if (!@move_uploaded_file($tmpName, $dest)) {
+            return false;
+        }
+        @chmod($dest, 0644);
+
+        return true;
+    }
+
+    /**
+     * Detects the real MIME type of a file (finfo preferred, fallback to mime_content_type).
+     *
+     * @param string $path
+     *
+     * @return string|null
+     */
+    protected function detectMimeType($path)
+    {
+        if (function_exists('finfo_open')) {
+            $finfo = finfo_open(FILEINFO_MIME_TYPE);
+            if ($finfo) {
+                $mime = finfo_file($finfo, $path);
+                finfo_close($finfo);
+
+                return $mime === false ? null : $mime;
+            }
+        }
+        if (function_exists('mime_content_type')) {
+            $mime = @mime_content_type($path);
+
+            return $mime === false ? null : $mime;
+        }
+
+        return null; // cannot verify — rely on extension check
+    }
+
+    /**
+     * Deletes any previously uploaded local video for a product.
+     */
+    protected function deleteLocalVideoFile($id_product)
+    {
+        foreach (self::ALLOWED_EXTENSIONS as $ext) {
+            $path = _PS_IMG_DIR_ . 'pv/' . (int) $id_product . '.' . $ext;
+            if (is_file($path)) {
+                @unlink($path);
+            }
+        }
     }
 
     /* ------------------------------------------------------------------ */
@@ -251,6 +415,7 @@ class Product_Video extends Module
     {
         $id_product = isset($params['id_product']) ? (int) $params['id_product'] : 0;
         if ($id_product) {
+            $this->deleteLocalVideoFile($id_product);
             Db::getInstance()->execute(sprintf(
                 'DELETE FROM `%s` WHERE id_product = %d',
                 pSQL($this->_getTableName()), $id_product
@@ -284,6 +449,10 @@ class Product_Video extends Module
         }
         if (preg_match('~^https?://.*\.(mp4|webm|ogv)(\?.*)?$~', $url)) {
             return self::TYPE_DIRECT;
+        }
+        // File uploaded through this module: img/pv/<id>.<ext>
+        if (preg_match('~^img/pv/\d+\.(mp4|webm|ogv)$~', $url)) {
+            return self::TYPE_LOCAL;
         }
 
         return false;
@@ -371,6 +540,15 @@ class Product_Video extends Module
                 return sprintf(
                     '<video class="pv-video" controls preload="metadata" width="%d" height="%d" src="%s"></video>',
                     (int) $width, (int) $height, pSQL($url)
+                );
+
+            case self::TYPE_LOCAL:
+                // Uploaded file stored under /img/pv/ — build absolute url via Media
+                $abs = Media::getMediaPath(_PS_IMG_DIR_ . substr($url, strlen('img/')));
+
+                return sprintf(
+                    '<video class="pv-video" controls preload="metadata" width="%d" height="%d" src="%s"></video>',
+                    (int) $width, (int) $height, pSQL($abs)
                 );
 
             default:

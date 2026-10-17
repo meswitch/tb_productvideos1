@@ -52,3 +52,13 @@ product_video/
         ├── admin/video_tab.tpl   (BO field)
         └── hook/product_video.tpl (FO output in image block)
 ```
+
+## Uploading video files (v1.1.0+)
+
+Besides hosted links, you can now upload video files directly:
+
+- On the product page (back office) use the **"…or upload a video file"** field in the *Product Video* panel.
+- Allowed formats: **mp4, webm, ogv** — max **100 MB** per file (the module limit; your PHP `upload_max_filesize` / `post_max_size` may be lower — raise them in php.ini or via your host if needed).
+- Files are stored under `img/pv/<id_product>.<ext>` and served with HTML5 `<video controls>`.
+- Security checks: extension whitelist + real MIME sniffing (finfo), size limit, filename derived from the product id (user file names are never used).
+- Re-uploading replaces the previous file; deleting the product removes the file automatically.
