@@ -53,7 +53,7 @@ product_video/
         └── hook/product_video.tpl (FO output in image block)
 ```
 
-## Uploading video files (v1.1.0+)
+## Uploading video files (v1.2.0+)
 
 Besides hosted links, you can now upload video files directly:
 
