@@ -37,11 +37,17 @@ class Product_Video extends Module
     {
         $this->name = 'product_video';
         $this->tab = 'front_office_features';
-        $this->version = '1.1.0';
+        $this->version = '1.2.0';
         $this->author = 'Your Name';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array('min' => '1.0', 'max' => _PS_VERSION_);
-        $this->bootstrap = false;
+        $this->bootstrap = true;
+
+        // Explicit values: do not rely on Module core magic getters ($this->table /
+        // $this->identifier), which are unavailable/renamed in some ThirtyBeeS builds
+        // and caused a fatal error ("Tab : ModuleProduct" 500) on the product page.
+        $this->table = 'product_video';
+        $this->identifier = 'id_product';
 
         parent::__construct();
 
@@ -91,7 +97,7 @@ class Product_Video extends Module
 
     protected function _getTableName()
     {
-        return $this->table; // product_video
+        return $this->table ? $this->table : 'product_video';
     }
 
     protected function executeSql($sql)
@@ -153,6 +159,7 @@ class Product_Video extends Module
         $helper->show_toolbar = false;
         $helper->module = $this;
         $helper->default_form_language = (int) Configuration::get('PS_LANG_DEFAULT');
+        $helper->allow_employee_form_lang = (int) Configuration::get('PS_BO_ALLOW_EMPLOYEE_FORM_LANG');
         $helper->identifier = $this->identifier;
         $helper->submit_action = 'submitProductVideoSettings';
         $helper->currentIndex = $this->context->link->getAdminLink('AdminModules', false)
@@ -173,22 +180,34 @@ class Product_Video extends Module
      */
     public function hookDisplayAdminProductsExtra($params)
     {
-        $id_product = (int) Tools::getValue('id_product');
-        if ($id_product <= 0 && isset($params['id_product'])) {
-            $id_product = (int) $params['id_product'];
+        // Defensive: never let an error here blow up the whole product page (500).
+        try {
+            $id_product = isset($params['id_product']) ? (int) $params['id_product'] : 0;
+            if ($id_product <= 0) {
+                $id_product = (int) Tools::getValue('id_product');
+            }
+            if ($id_product <= 0) {
+                return ''; // new product, nothing to edit yet
+            }
+
+            $video = $this->getProductVideo($id_product);
+
+            $this->context->smarty->assign(array(
+                'pv_id_product' => $id_product,
+                'pv_video_url' => $video['video_url'],
+                'pv_is_local' => $this->getVideoType($video['video_url']) === self::TYPE_LOCAL,
+                'pv_max_size_mb' => self::MAX_SIZE_MB,
+                'pv_token' => Tools::getAdminTokenLite('AdminProducts'),
+            ));
+
+            return $this->fetch('module/product_video/views/templates/admin/video_tab.tpl');
+        } catch (Exception $e) {
+            if (isset($this->context->_PS_MODE_DEV_) && _PS_MODE_DEV_) {
+                throw $e;
+            }
+
+            return '<div class="panel"><p>' . htmlspecialchars($this->name . ' error: ' . $e->getMessage()) . '</p></div>';
         }
-
-        $video = $this->getProductVideo($id_product);
-
-        $this->context->smarty->assign(array(
-            'pv_id_product' => $id_product,
-            'pv_video_url' => $video['video_url'],
-            'pv_is_local' => $this->getVideoType($video['video_url']) === self::TYPE_LOCAL,
-            'pv_max_size_mb' => self::MAX_SIZE_MB,
-            'pv_token' => Tools::getAdminTokenLite('AdminProducts'),
-        ));
-
-        return $this->fetch('views/templates/admin/video_tab.tpl');
     }
 
     /**
@@ -201,7 +220,15 @@ class Product_Video extends Module
             return;
         }
 
-        $id_product = (int) Tools::getValue('id_product');
+        $id_product = isset($params['id_product']) ? (int) $params['id_product'] : 0;
+        if ($id_product <= 0) {
+            // Older ThirtyBeeS builds may not pass id_product in params — fall back to the request.
+            $id_product = (int) Tools::getValue('id_product');
+            if ($id_product <= 0 && isset($params['object']) && $params['object'] instanceof ObjectModel) {
+                $id_product = (int) $params['object']->id;
+            }
+        }
+
         $url = trim((string) Tools::getValue('pv_video_url'));
 
         // Handle a file upload coming from the "Upload a video file" field
@@ -376,14 +403,28 @@ class Product_Video extends Module
 
     public function getProductVideo($id_product)
     {
-        $row = Db::getInstance(_PS_USE_SQL_SLAVE_)->getRow(sprintf('
-            SELECT video_url
-            FROM `%s`
-            WHERE id_product = %d AND id_shop = %d
-        ', pSQL($this->_getTableName()), (int) $id_product, (int) $this->context->shop->id));
+        $default = array('video_url' => '');
+
+        $id_product = (int) $id_product;
+        if ($id_product <= 0) {
+            return $default;
+        }
+
+        // Defensive: if the module table is missing (e.g. module files were copied
+        // manually without running the installer), return empty instead of throwing,
+        // which previously caused a 500 error on the product page in the BO.
+        try {
+            $row = Db::getInstance(_PS_USE_SQL_SLAVE_)->getRow(sprintf('
+                SELECT video_url
+                FROM `%s`
+                WHERE id_product = %d AND id_shop = %d
+            ', pSQL($this->_getTableName()), $id_product, (int) $this->context->shop->id));
+        } catch (Exception $e) {
+            return $default;
+        }
 
         return array(
-            'video_url' => $row ? $row['video_url'] : '',
+            'video_url' => $row && isset($row['video_url']) ? $row['video_url'] : '',
         );
     }
 
@@ -571,24 +612,28 @@ class Product_Video extends Module
      */
     public function hookDisplayProductImages($params)
     {
-        $id_product = isset($params['id_product']) ? (int) $params['id_product'] : 0;
-        if ($id_product <= 0) {
+        try {
+            $id_product = isset($params['id_product']) ? (int) $params['id_product'] : 0;
+            if ($id_product <= 0) {
+                return '';
+            }
+
+            $video = $this->getProductVideo($id_product);
+            if (empty($video['video_url']) || !$this->validateVideoUrl($video['video_url'])) {
+                return '';
+            }
+
+            $this->context->controller->addCSS($this->_path . 'views/css/product_video.css', 'all');
+
+            $this->context->smarty->assign(array(
+                'pv_video_html' => $this->renderVideoHtml($video['video_url']),
+                'pv_video_position' => Configuration::get('PRODUCT_VIDEO_POSITION'),
+            ));
+
+            return $this->fetch('module/product_video/views/templates/hook/product_video.tpl');
+        } catch (Exception $e) {
             return '';
         }
-
-        $video = $this->getProductVideo($id_product);
-        if (empty($video['video_url']) || !$this->validateVideoUrl($video['video_url'])) {
-            return '';
-        }
-
-        $this->context->controller->addCSS($this->_path . 'views/css/product_video.css', 'all');
-
-        $this->context->smarty->assign(array(
-            'pv_video_html' => $this->renderVideoHtml($video['video_url']),
-            'pv_video_position' => Configuration::get('PRODUCT_VIDEO_POSITION'),
-        ));
-
-        return $this->display(__FILE__, 'views/templates/hook/product_video.tpl');
     }
 
     /**
