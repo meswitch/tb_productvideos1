@@ -1,0 +1,40 @@
+/**
+ * Product Video module styles.
+ * Makes iframes/videos responsive and blends them into the product image block.
+ */
+
+.product-video {
+    margin: 0 0 15px;
+}
+
+/* When shown as a gallery slide, match the image block width */
+.product-video--gallery {
+    width: 100%;
+}
+
+/* Responsive 16:9 wrapper for iframe embeds */
+.product-video__frame {
+    position: relative;
+    width: 100%;
+    padding-bottom: 56.25%; /* 16:9 */
+    height: 0;
+    overflow: hidden;
+    border-radius: 4px;
+    background: #000;
+}
+
+.product-video__frame iframe.pv-embed,
+.product-video__frame video.pv-video {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100% !important;
+    height: 100% !important;
+    border: 0;
+}
+
+/* Direct HTML5 video keeps its own controls, just make it fluid */
+video.pv-video {
+    max-width: 100%;
+    height: auto;
+}
